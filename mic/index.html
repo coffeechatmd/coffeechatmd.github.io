@@ -26,6 +26,7 @@
   .recording { background: var(--rec); } .off { background: var(--off); } .waiting { background: var(--wait); } .ended { background: var(--off); }
   .sent { display: flex; justify-content: space-between; border-top: 1px solid var(--line); padding-top: .7rem; margin-top: 1rem; }
   .error { color: var(--rec); font-weight: 600; }
+  .sentence { font-size: 1.2rem; font-weight: 600; margin: 1rem 0; padding: .8rem 1rem; border-left: 4px solid var(--fg); }
   [hidden] { display: none !important; }
 </style>
 </head>
@@ -50,6 +51,15 @@
     <p class="muted">Transcripts call you P1, P2, …; your name stays with the research team.</p>
     <button id="start" disabled>Start my microphone</button>
     <p id="joinError" class="error" hidden></p>
+  </section>
+
+  <section id="sample" hidden>
+    <h1>Your voice sample</h1>
+    <p class="muted">So the transcript can tell your voice from everyone else's, read this sentence aloud once, at your normal speaking volume:</p>
+    <p class="sentence">“I'm taking part in this research meeting, and this is how I normally speak.”</p>
+    <button id="record">Record my sample</button>
+    <p id="sampleStatus" class="muted" aria-live="polite"></p>
+    <button id="skip" class="secondary">Skip</button>
   </section>
 
   <section id="live" hidden>
@@ -85,7 +95,7 @@ async function api(path, options = {}) {
 }
 
 function show(section) {
-  for (const id of ["nolink", "join", "live"]) $(id).hidden = id !== section;
+  for (const id of ["nolink", "join", "sample", "live"]) $(id).hidden = id !== section;
 }
 
 function setState(kind, title, detail = "") {
@@ -110,7 +120,7 @@ function startPart() {
   const thisPart = part, started = now();
   let n = 0;
   const type = bestType();
-  recorder = new MediaRecorder(stream, type ? { mimeType: type, audioBitsPerSecond: 64000 } : {});
+  recorder = new MediaRecorder(stream, type ? { mimeType: type, audioBitsPerSecond: 128000 } : {});
   recorder.ondataavailable = (e) => {
     if (e.data && e.data.size) queue.push({ part: thisPart, seq: n++, blob: e.data, type: e.data.type || type, started, ended: now() });
   };
@@ -181,6 +191,36 @@ document.addEventListener("visibilitychange", () => {
   }
 });
 
+async function recordSample() {
+  $("record").disabled = $("skip").disabled = true;
+  const type = bestType();
+  const rec = new MediaRecorder(stream, type ? { mimeType: type, audioBitsPerSecond: 128000 } : {});
+  const pieces = [];
+  rec.ondataavailable = (e) => { if (e.data && e.data.size) pieces.push(e.data); };
+  const stopped = new Promise((resolve) => { rec.onstop = resolve; });
+  rec.start();
+  for (let s = 6; s > 0; s--) { $("sampleStatus").textContent = `Recording… ${s}`; await sleep(1000); }
+  rec.stop();
+  await stopped;
+  $("sampleStatus").textContent = "Sending…";
+  try {
+    const blob = new Blob(pieces, { type: (pieces[0] && pieces[0].type) || type || "audio/webm" });
+    await api(`/enroll?phone=${phone}`, { method: "POST", body: blob, headers: { "Content-Type": blob.type } });
+    $("sampleStatus").textContent = "Thanks, got it.";
+  } catch (e) {
+    $("sampleStatus").textContent = "Couldn't send the sample; carrying on without it.";
+  }
+  await sleep(700);
+  goLive();
+}
+
+function goLive() {
+  show("live");
+  keepAwake();
+  sendForever();
+  follow();
+}
+
 async function start() {
   $("start").disabled = true;
   $("joinError").hidden = true;
@@ -195,10 +235,7 @@ async function start() {
     phone = joined.phone;
     try { localStorage.setItem("coffee_chat_name", $("name").value); } catch (e) { /* private mode */ }
     $("speaker").textContent = `You are ${joined.speaker}`;
-    show("live");
-    keepAwake();
-    sendForever();
-    follow();
+    show("sample");
   } catch (e) {
     if (stream) stream.getTracks().forEach((t) => t.stop());
     $("joinError").textContent = e.name === "NotAllowedError"
@@ -218,6 +255,8 @@ function init() {
   $("name").addEventListener("input", ready);
   $("consent").addEventListener("change", ready);
   $("start").addEventListener("click", start);
+  $("record").addEventListener("click", recordSample);
+  $("skip").addEventListener("click", goLive);
   $("mute").addEventListener("click", () => {
     muted = !muted;
     $("mute").textContent = muted ? "Unmute me" : "Mute me";
