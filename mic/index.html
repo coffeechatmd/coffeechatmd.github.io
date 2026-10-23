@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#111111">
+<title>coffee_chat mic</title>
+<style>
+  :root { --bg: #ffffff; --fg: #111111; --muted: #5b5b5b; --line: #dddddd; --rec: #c62828; --off: #6b6b6b; --wait: #b26a00; --ok: #2e7d32; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #111111; --fg: #f2f2f2; --muted: #a8a8a8; --line: #333333; } }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 17px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 32rem; margin: 0 auto; padding: max(1.2rem, env(safe-area-inset-top)) 16px 2rem; }
+  h1 { font-size: 1.5rem; margin: 0 0 .4rem; }
+  p { margin: .5rem 0; }
+  .muted { color: var(--muted); font-size: .92rem; }
+  label { display: block; margin: 1rem 0 .3rem; font-weight: 600; }
+  input[type=text], select { width: 100%; font: inherit; padding: .7rem .8rem; border: 1px solid var(--line); border-radius: .6rem; background: var(--bg); color: var(--fg); }
+  .consent { display: flex; gap: .6rem; align-items: flex-start; font-weight: 400; margin-top: 1.2rem; }
+  .consent input { width: 1.4rem; height: 1.4rem; margin-top: .1rem; flex: none; }
+  button { width: 100%; font: inherit; font-weight: 700; padding: 1rem; margin-top: 1.2rem; border: 0; border-radius: .8rem; background: var(--fg); color: var(--bg); }
+  button.secondary { background: transparent; color: var(--fg); border: 1px solid var(--line); font-weight: 600; }
+  button:disabled { opacity: .35; }
+  .state { margin: 1rem 0; padding: 2.2rem 1rem; border-radius: 1rem; text-align: center; color: #fff; font-size: 1.9rem; font-weight: 800; letter-spacing: .02em; }
+  .state small { display: block; font-size: 1rem; font-weight: 500; margin-top: .4rem; opacity: .95; }
+  .recording { background: var(--rec); } .off { background: var(--off); } .waiting { background: var(--wait); } .ended { background: var(--off); }
+  .sent { display: flex; justify-content: space-between; border-top: 1px solid var(--line); padding-top: .7rem; margin-top: 1rem; }
+  .error { color: var(--rec); font-weight: 600; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<main>
+  <section id="nolink" hidden>
+    <h1>coffee_chat mic</h1>
+    <p>Open this page by scanning the code on the room screen. The code holds the address of the room and the key for this meeting.</p>
+  </section>
+
+  <section id="join" hidden>
+    <h1>Use your phone as your microphone</h1>
+    <p class="muted">This meeting is recorded for research. While the room records, your phone records you and sends the audio straight to the room's computer; nothing is kept on your phone. When anyone goes off the record, your phone stops too, and you can mute it yourself at any time.</p>
+    <label for="name">Your name</label>
+    <input id="name" type="text" autocomplete="name" maxlength="60" placeholder="First and last name">
+    <label for="role">Your role (optional)</label>
+    <select id="role">
+      <option value="">Choose…</option><option>Professor</option><option>Postdoc</option><option>Student</option>
+      <option>Researcher</option><option>Clinician</option><option>Guest</option><option>Other</option>
+    </select>
+    <label class="consent"><input id="consent" type="checkbox"> <span>I agree to be recorded in this meeting for the research study I was told about.</span></label>
+    <p class="muted">Transcripts call you P1, P2, …; your name stays with the research team.</p>
+    <button id="start" disabled>Start my microphone</button>
+    <p id="joinError" class="error" hidden></p>
+  </section>
+
+  <section id="live" hidden>
+    <div id="state" class="state waiting">Connecting…<small></small></div>
+    <p class="muted">Keep this page open and the screen on. A shirt pocket or the table right in front of you works best.</p>
+    <button id="mute" class="secondary">Mute me</button>
+    <div class="sent"><span id="speaker"></span><span id="queue" class="muted"></span></div>
+    <p id="liveError" class="error" hidden></p>
+    <button id="leave" class="secondary">Leave</button>
+  </section>
+</main>
+
+<script>
+"use strict";
+const params = new URLSearchParams(location.search);
+const ROOM = (params.get("room") || "").replace(/\/+$/, "");
+const KEY = params.get("key") || "";
+const $ = (id) => document.getElementById(id);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const now = () => Date.now() / 1000;
+
+let phone = null, stream = null, recorder = null, part = -1, muted = false, ended = false, wakeLock = null;
+const queue = [];  // pieces waiting to be sent: {part, seq, blob, type, started, ended}
+
+class ApiError extends Error { constructor(status, message) { super(message); this.status = status; } }
+
+async function api(path, options = {}) {
+  const url = `${ROOM}${path}${path.includes("?") ? "&" : "?"}key=${encodeURIComponent(KEY)}`;
+  const reply = await fetch(url, options);
+  const body = await reply.json().catch(() => ({}));
+  if (!reply.ok) throw new ApiError(reply.status, body.error || `error ${reply.status}`);
+  return body;
+}
+
+function show(section) {
+  for (const id of ["nolink", "join", "live"]) $(id).hidden = id !== section;
+}
+
+function setState(kind, title, detail = "") {
+  const el = $("state");
+  el.className = `state ${kind}`;
+  el.innerHTML = "";
+  el.append(title);
+  const small = document.createElement("small");
+  small.textContent = detail;
+  el.append(small);
+}
+
+function bestType() {
+  for (const t of ["audio/webm;codecs=opus", "audio/mp4", "audio/webm", "audio/ogg;codecs=opus"]) {
+    if (window.MediaRecorder && MediaRecorder.isTypeSupported(t)) return t;
+  }
+  return "";
+}
+
+function startPart() {
+  part += 1;
+  const thisPart = part, started = now();
+  let n = 0;
+  const type = bestType();
+  recorder = new MediaRecorder(stream, type ? { mimeType: type, audioBitsPerSecond: 64000 } : {});
+  recorder.ondataavailable = (e) => {
+    if (e.data && e.data.size) queue.push({ part: thisPart, seq: n++, blob: e.data, type: e.data.type || type, started, ended: now() });
+  };
+  recorder.start(5000);  // a piece every 5 seconds
+}
+
+function stopPart() {
+  if (recorder && recorder.state !== "inactive") recorder.stop();  // flushes the last piece
+  recorder = null;
+}
+
+async function sendForever() {
+  while (!ended || queue.length) {
+    if (!queue.length) { await sleep(400); continue; }
+    const p = queue[0];
+    const q = `/chunk?phone=${phone}&part=${p.part}&seq=${p.seq}&started=${p.started}&ended=${p.ended}`;
+    try {
+      await api(q, { method: "POST", body: p.blob, headers: { "Content-Type": p.type } });
+      queue.shift();
+    } catch (e) {
+      if (e instanceof ApiError && (e.status === 409 || e.status === 403 || e.status === 400)) queue.shift();  // not wanted: drop it
+      else await sleep(2000);  // the network: try again
+    }
+    $("queue").textContent = queue.length ? `${queue.length} piece${queue.length > 1 ? "s" : ""} waiting to send` : "all audio sent";
+  }
+}
+
+async function follow() {
+  while (!ended) {
+    try {
+      const s = await api("/status");
+      $("liveError").hidden = true;
+      const record = s.recording && !s.off_record && !muted;
+      if (record && !recorder) startPart();
+      if (!record && recorder) stopPart();
+      if (!s.recording) { finish("The meeting has ended", "You can close this page."); break; }
+      else if (s.off_record) setState("off", "Off the record", "Your phone is not recording");
+      else if (muted) setState("waiting", "Muted", "Tap “Unmute me” to record again");
+      else setState("recording", "Recording", "Your phone is your microphone");
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 403) { finish("The meeting has ended", "You can close this page."); break; }
+      $("liveError").textContent = "Can't reach the room. Still trying…";
+      $("liveError").hidden = false;
+    }
+    await sleep(1500);
+  }
+}
+
+function finish(title, detail) {
+  ended = true;
+  stopPart();
+  if (stream) stream.getTracks().forEach((t) => t.stop());
+  setState("ended", title, detail);
+  $("mute").hidden = $("leave").hidden = true;
+}
+
+async function keepAwake() {
+  try { if ("wakeLock" in navigator) wakeLock = await navigator.wakeLock.request("screen"); } catch (e) { /* not allowed now */ }
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && !ended) {
+    keepAwake();
+    if (stream && stream.getAudioTracks().some((t) => t.readyState === "ended")) {
+      $("liveError").textContent = "The phone stopped the microphone while this page was hidden. Tap Leave and scan the code again.";
+      $("liveError").hidden = false;
+    }
+  }
+});
+
+async function start() {
+  $("start").disabled = true;
+  $("joinError").hidden = true;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 1 },
+    });
+    const joined = await api("/join", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: $("name").value, role: $("role").value, now: now() }),
+    });
+    phone = joined.phone;
+    try { localStorage.setItem("coffee_chat_name", $("name").value); } catch (e) { /* private mode */ }
+    $("speaker").textContent = `You are ${joined.speaker}`;
+    show("live");
+    keepAwake();
+    sendForever();
+    follow();
+  } catch (e) {
+    if (stream) stream.getTracks().forEach((t) => t.stop());
+    $("joinError").textContent = e.name === "NotAllowedError"
+      ? "The microphone is blocked. Allow it for this page in your browser settings, then try again."
+      : e instanceof ApiError && e.status === 403 ? "This code is for a meeting that has ended. Scan the code on the room screen again."
+      : e instanceof ApiError && e.status === 409 ? "The room isn't recording yet. Try again once it starts."
+      : `Couldn't start: ${e.message}`;
+    $("joinError").hidden = false;
+    $("start").disabled = false;
+  }
+}
+
+function init() {
+  if (!ROOM || !KEY) return show("nolink");
+  try { $("name").value = localStorage.getItem("coffee_chat_name") || ""; } catch (e) { /* private mode */ }
+  const ready = () => { $("start").disabled = !($("name").value.trim() && $("consent").checked); };
+  $("name").addEventListener("input", ready);
+  $("consent").addEventListener("change", ready);
+  $("start").addEventListener("click", start);
+  $("mute").addEventListener("click", () => {
+    muted = !muted;
+    $("mute").textContent = muted ? "Unmute me" : "Mute me";
+    if (muted) stopPart();
+  });
+  $("leave").addEventListener("click", () => finish("You left the meeting", "Scan the code again to rejoin."));
+  if (!window.MediaRecorder || !navigator.mediaDevices) {
+    $("joinError").textContent = "This browser can't record audio. Use Safari on iPhone or Chrome on Android.";
+    $("joinError").hidden = false;
+  }
+  show("join");
+}
+
+init();
+</script>
+</body>
+</html>
