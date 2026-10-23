@@ -75,7 +75,7 @@
 <script>
 "use strict";
 const params = new URLSearchParams(location.search);
-const ROOM = (params.get("room") || "").replace(/\/+$/, "");
+const ROOM = (params.get("room") || location.origin).replace(/\/+$/, "");  // the page may be served by the room's own server
 const KEY = params.get("key") || "";
 const $ = (id) => document.getElementById(id);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -249,7 +249,7 @@ async function start() {
 }
 
 function init() {
-  if (!ROOM || !KEY) return show("nolink");
+  if (!KEY) return show("nolink");
   try { $("name").value = localStorage.getItem("coffee_chat_name") || ""; } catch (e) { /* private mode */ }
   const ready = () => { $("start").disabled = !($("name").value.trim() && $("consent").checked); };
   $("name").addEventListener("input", ready);
